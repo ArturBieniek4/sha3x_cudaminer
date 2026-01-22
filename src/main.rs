@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{info, warn};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -123,6 +124,7 @@ fn gpu_thread(
     let mut last_log = Instant::now();
     let start_time = Instant::now();
     let mut last_batch_hashes_per_ms = 0.0f64;
+    let mut rate_window: VecDeque<(Instant, u64)> = VecDeque::new();
 
     loop {
         let job = { current_job.lock().unwrap().clone() };
@@ -186,17 +188,34 @@ fn gpu_thread(
         if last_log.elapsed() >= Duration::from_secs(1) {
             last_log = Instant::now();
             let total = hashes_total.load(Ordering::Relaxed);
-            let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
-            let rate_mhs = (total as f64 / elapsed) / 1e6;
+            let now = Instant::now();
+            rate_window.push_back((now, total));
+            while let Some((t, _)) = rate_window.front() {
+                if now.duration_since(*t) > Duration::from_secs(60) {
+                    rate_window.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let (window_secs, window_hashes) = if let Some((t0, h0)) = rate_window.front() {
+                let dt = now.duration_since(*t0).as_secs_f64().max(0.001);
+                let dh = total.saturating_sub(*h0);
+                (dt, dh)
+            } else {
+                (start_time.elapsed().as_secs_f64().max(0.001), total)
+            };
+            let rate_mhs = (window_hashes as f64 / window_secs) / 1e6;
             let ok = shares_accepted.load(Ordering::Relaxed);
             let bad = shares_rejected.load(Ordering::Relaxed);
             let found = shares_found.load(Ordering::Relaxed);
+            let found_rate = (found as f64) / start_time.elapsed().as_secs_f64().max(0.001);
 
             info!(
-                "hashrate≈{:.2} MH/s | total_hashes={} | found={} | acc/rej={}/{}",
+                "hashrate≈{:.2} MH/s | total_hashes={} | found={} | found/s={:.3} | acc/rej={}/{}",
                 rate_mhs,
                 total,
                 found,
+                found_rate,
                 ok,
                 bad
             );
