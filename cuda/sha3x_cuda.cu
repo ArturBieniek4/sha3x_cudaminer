@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 #define CUDA_OK(x) do { if ((x) != cudaSuccess) return 1; } while(0)
 
@@ -26,6 +27,7 @@ struct __align__(8) host_mapped_result_t {
 
 static int g_blocks  = 0;
 static int g_threads = 0;
+static int g_xn_enabled = 0;
 
 static host_mapped_result_t* g_hres = nullptr;
 static host_mapped_result_t* g_dres = nullptr;
@@ -36,7 +38,6 @@ static cudaEvent_t g_ev_stop  = nullptr;
 // Job constants
 __device__ __constant__ uint64_t c_mining_hash[4]; // 32 bytes as 4 LE u64 lanes
 __device__ __constant__ uint64_t c_target_u64;     // compare against leading_u64_be
-__device__ __constant__ uint32_t c_xn_enabled;
 __device__ __constant__ uint32_t c_xn;
 
 __device__ unsigned int       d_found = 0;
@@ -213,7 +214,7 @@ __device__ __forceinline__ void sha3x(uint64_t mh0, uint64_t mh1, uint64_t mh2, 
     sha3_256_32(t2, out);
 }
 
-__global__ __launch_bounds__(256) void sha3x_kernel(
+__global__ void sha3x_kernel_plain(
     uint64_t start,
     uint32_t iters_per_thread,
     host_mapped_result_t* __restrict__ out
@@ -226,17 +227,13 @@ __global__ __launch_bounds__(256) void sha3x_kernel(
     const uint64_t mh2 = c_mining_hash[2];
     const uint64_t mh3 = c_mining_hash[3];
 
-    const uint32_t xn_en = c_xn_enabled;
-    const uint64_t xn    = (uint64_t)(c_xn & 0xFFFFu);
-
-    uint64_t ctr   = start + tid; // xn mode counter
-    uint64_t nonce = start + tid; // plain nonce
+    uint64_t nonce = start + tid;
 
 #pragma unroll 1
     for (uint32_t i = 0; i < iters_per_thread; ++i) {
         if ((i & 0xFFu) == 0u && load_found_cg()) return;
 
-        const uint64_t n = xn_en ? ((ctr << 16) | xn) : nonce;
+        const uint64_t n = nonce;
 
         uint64_t h[4];
         sha3x(mh0, mh1, mh2, mh3, n, h);
@@ -260,8 +257,54 @@ __global__ __launch_bounds__(256) void sha3x_kernel(
             return;
         }
 
-        if (xn_en) ctr += step;
-        else       nonce += step;
+        nonce += step;
+    }
+}
+
+__global__ void sha3x_kernel_xn(
+    uint64_t start,
+    uint32_t iters_per_thread,
+    host_mapped_result_t* __restrict__ out
+) {
+    const uint64_t tid  = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+    const uint64_t step = (uint64_t)gridDim.x  * (uint64_t)blockDim.x;
+
+    const uint64_t mh0 = c_mining_hash[0];
+    const uint64_t mh1 = c_mining_hash[1];
+    const uint64_t mh2 = c_mining_hash[2];
+    const uint64_t mh3 = c_mining_hash[3];
+    const uint64_t xn  = (uint64_t)(c_xn & 0xFFFFu);
+
+    uint64_t ctr = start + tid;
+
+#pragma unroll 1
+    for (uint32_t i = 0; i < iters_per_thread; ++i) {
+        if ((i & 0xFFu) == 0u && load_found_cg()) return;
+
+        const uint64_t n = (ctr << 16) | xn;
+
+        uint64_t h[4];
+        sha3x(mh0, mh1, mh2, mh3, n, h);
+
+        const uint64_t lead_be = bswap64(h[0]);
+
+        if (lead_be <= c_target_u64) {
+            if (atomicCAS(&d_found, 0u, 1u) == 0u) {
+                d_nonce = (unsigned long long)n;
+
+                out->nonce = n;
+                ((uint64_t*)out->hash)[0] = h[0];
+                ((uint64_t*)out->hash)[1] = h[1];
+                ((uint64_t*)out->hash)[2] = h[2];
+                ((uint64_t*)out->hash)[3] = h[3];
+
+                __threadfence_system();
+                out->found = 1u;
+            }
+            return;
+        }
+
+        ctr += step;
     }
 }
 
@@ -271,11 +314,8 @@ int sha3x_cuda_init(int device, int requested_blocks, int requested_threads, int
     cudaDeviceProp prop;
     CUDA_OK(cudaGetDeviceProperties(&prop, device));
 
-    int threads = (requested_threads > 0) ? requested_threads : 256;
-    int blocks  = (requested_blocks  > 0) ? requested_blocks  : (prop.multiProcessorCount * 4);
-
-    if (blocks < 1) blocks = 1;
-    if (blocks > 65535) blocks = 65535;
+    int threads = (requested_threads > 0) ? requested_threads : 896;
+    int blocks  = (requested_blocks  > 0) ? requested_blocks  : (prop.multiProcessorCount * 1);
 
     g_blocks  = blocks;
     g_threads = threads;
@@ -297,7 +337,6 @@ int sha3x_cuda_init(int device, int requested_blocks, int requested_threads, int
         uint32_t z32 = 0;
         uint64_t t = 0xFFFFFFFFFFFFFFFFULL;
         CUDA_OK(cudaMemcpyToSymbol(c_target_u64, &t, sizeof(uint64_t)));
-        CUDA_OK(cudaMemcpyToSymbol(c_xn_enabled, &z32, sizeof(uint32_t)));
         CUDA_OK(cudaMemcpyToSymbol(c_xn, &z32, sizeof(uint32_t)));
         CUDA_OK(cudaMemcpyToSymbol(d_found, &z32, sizeof(uint32_t)));
         uint64_t z64 = 0;
@@ -324,8 +363,8 @@ int sha3x_cuda_set_job(const uint8_t* mining_hash32, uint64_t target_u64, uint16
 
     CUDA_OK(cudaMemcpyToSymbol(c_mining_hash, mh, sizeof(mh)));
     CUDA_OK(cudaMemcpyToSymbol(c_target_u64, &target_u64, sizeof(uint64_t)));
-    CUDA_OK(cudaMemcpyToSymbol(c_xn_enabled, &xn_en, sizeof(uint32_t)));
     CUDA_OK(cudaMemcpyToSymbol(c_xn, &xn32, sizeof(uint32_t)));
+    g_xn_enabled = (int)xn_en;
     return 0;
 }
 
@@ -345,7 +384,15 @@ int sha3x_cuda_run_batch(uint64_t start, uint32_t iters_per_thread, sha3x_batch_
     }
 
     CUDA_OK(cudaEventRecord(g_ev_start, 0));
-    sha3x_kernel<<<g_blocks, g_threads>>>(start, iters_per_thread, g_dres);
+    if (g_xn_enabled) {
+        sha3x_kernel_xn<<<g_blocks, g_threads>>>(start, iters_per_thread, g_dres);
+    } else {
+        sha3x_kernel_plain<<<g_blocks, g_threads>>>(start, iters_per_thread, g_dres);
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        fprintf(stderr, "Kernel launch error: %s\n", cudaGetErrorString(e));
+    }
     CUDA_OK(cudaEventRecord(g_ev_stop, 0));
     CUDA_OK(cudaEventSynchronize(g_ev_stop));
 
